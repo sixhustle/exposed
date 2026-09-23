@@ -65,7 +65,8 @@ class RedisCacheTest @Autowired constructor(
 		bookService.create(BookCreateRequest("코틀린", BookType.COMPUTER, 10_000, authorId))
 
 		val first = bookService.countByType() // DB 조회 후 캐시에 저장
-		assertThat(redisTemplate.hasKey("bookStats::all")).isTrue()
+		// 캐시 쓰기/비우기는 Redis에 즉시 보이지 않을 수 있다 → 폴링으로 확인한다
+		awaitUntil { redisTemplate.hasKey("bookStats::all") }
 
 		val second = bookService.countByType() // 이번엔 Redis에서
 		assertThat(second).isEqualTo(first)

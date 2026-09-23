@@ -1142,77 +1142,142 @@ InteropSampleKt.sum(1, 2);                            // 최상위 함수
 
 ## 15. 코루틴
 
-### 15-1. 코루틴이 뭔가요? (스레드와 비교)
+> 이 장은 "코루틴을 한 번도 안 써 본 Java 개발자"를 기준으로 처음부터 설명한다.
+> 예제는 `CoroutineBasicsTest`, `DashboardService`, `CoroutineTransactionTest`에서 실행해 볼 수 있다.
 
-**비유**: 식당에 직원(스레드)이 몇 명 있다.
-- **스레드 방식**: 손님이 주문한 요리가 나올 때까지(= DB, 외부 API 응답 대기) 직원이 **그 테이블 옆에 서서 기다린다.** 손님이 많아지면 직원(스레드)을 계속 늘려야 하고, 직원 한 명은 비싸다(메모리 약 1MB).
-- **코루틴 방식**: 주문을 넣고 요리를 기다리는 동안 **직원은 다른 테이블을 응대하다가**, 요리가 나오면 돌아와서 이어서 서빙한다. 적은 직원으로 많은 손님을 받는다.
+### 15-1. 왜 필요한가 — 스레드가 "기다리는" 문제
 
-코드로 보면 "기다리는 동안 멈춰 있다가(suspend) 이어서(resume) 실행되는 함수"다. 실행 중 스레드를 점유하지 않으므로 **10만 개를 만들어도 가볍다**(`CoroutineBasicsTest`에서 확인).
+서버가 하는 일의 대부분은 **기다리는 일**이다. DB 응답을 기다리고, 외부 API 응답을 기다린다.
 
-| | Java 스레드 / `CompletableFuture` | Kotlin 코루틴 |
+```
+[스레드 방식]  요청 ─→ DB에 쿼리 ───(200ms 대기: 스레드는 아무것도 못 함)───→ 응답
+```
+- 스레드 하나는 메모리(스택)를 약 1MB 쓴다. 톰캣 기본 스레드 풀은 200개 정도다.
+- 동시 요청이 스레드 수를 넘으면 큐에서 대기한다. **CPU는 놀고 있는데 처리량이 안 나오는** 상태가 된다.
+
+**코루틴**은 "기다리는 지점에서 스레드를 잠시 놓아주는" 방식이다.
+```
+[코루틴]  요청 ─→ DB에 쿼리 ──(대기 중: 스레드는 다른 코루틴을 실행)──→ 응답 오면 이어서 실행
+```
+- 코루틴 하나는 객체 하나 수준이라 **10만 개를 만들어도 문제없다**(테스트로 확인).
+- 코드는 여전히 위에서 아래로 읽힌다. `CompletableFuture` 체인이나 콜백 지옥이 없다.
+
+| | Java 스레드 / CompletableFuture | Kotlin 코루틴 |
 |---|---|---|
-| 기다리는 코드 | `future.get()`(스레드 블로킹) 또는 `thenApply` 체인 | 그냥 순서대로 쓴 코드 + `suspend` |
-| 동시 실행 | `CompletableFuture.supplyAsync` ×2 + `allOf` | `async { }` ×2 + `await()` |
-| 취소·예외 전파 | 직접 관리 | **구조적 동시성**으로 자동 |
-| 비용 | 스레드당 메모리 큼 | 매우 가벼움 |
+| 기다리는 코드 | `future.get()`(스레드 블로킹) 또는 `thenApply` 체인 | `delay()`, `await()` — 순서대로 쓴 코드 |
+| 동시 실행 | `supplyAsync` ×2 + `allOf` | `async { }` ×2 + `await()` |
+| 취소·예외 전파 | 직접 관리 | 구조적 동시성으로 자동 |
+| 비용 | 스레드당 약 1MB | 매우 가벼움 |
 
-### 15-2. 기본 문법
+### 15-2. suspend 함수 — "잠시 멈출 수 있는 함수"
 
 ```kotlin
-suspend fun fetchPrice(): Int {       // suspend: 잠시 멈출 수 있는 함수
-	delay(1_000)                      // 1초 기다림. 이 동안 스레드는 다른 일을 한다
+suspend fun fetchPrice(): Int {
+	delay(1_000)      // 1초 "기다림". 단, 스레드를 붙잡지 않는다
 	return 20_000
 }
+```
+- **`suspend`가 붙은 함수는 다른 `suspend` 함수 안에서만 부를 수 있다.** (일반 함수에서 부르면 컴파일 에러)
+- **컴파일러가 하는 일**: `suspend fun`을 "중간에 멈췄다가 이어서 실행할 수 있는 상태 기계"로 바꾼다. 바이트코드를 보면 숨은 파라미터 `Continuation`(= 콜백)이 추가된다. 즉 **콜백을 컴파일러가 대신 써 주는 것**이다. `Show Kotlin Bytecode → Decompile`로 직접 볼 수 있다.
+- **`delay` ≠ `Thread.sleep`**
+  | | `Thread.sleep(1000)` | `delay(1000)` |
+  |---|---|---|
+  | 스레드 | 1초간 **붙잡는다** | 놓아준다(다른 코루틴이 사용) |
+  | 어디서 | 아무 데서나 | `suspend` 안에서만 |
+  | 테스트 | 실제로 1초 걸림 | `runTest`에서 **가상 시간**으로 즉시 |
 
+### 15-3. 코루틴을 시작하는 법 (빌더)
+
+| 빌더 | 뜻 | 반환 | 언제 |
+|---|---|---|---|
+| `launch { }` | "이 일 시작해 줘" | `Job` | 결과가 필요 없을 때 (알림 발송 등) |
+| `async { }` | "시작하고 결과는 나중에" | `Deferred<T>` → `.await()` | 결과를 모아야 할 때 |
+| `coroutineScope { }` | 자식이 **모두 끝나야** 다음 줄로 | 블록 결과 | suspend 함수 안에서 여러 개를 띄울 때 |
+| `withContext(ctx) { }` | 이 블록만 다른 스레드 풀에서 | 블록 결과 | JDBC 같은 블로킹 호출 |
+| `runBlocking { }` | 코루틴이 끝날 때까지 **스레드를 막고** 기다림 | 블록 결과 | `main`, 테스트에서만 |
+
+```kotlin
 // 순서대로 → 2초
 val a = fetchPrice()
 val b = fetchPrice()
 
 // 동시에 → 1초
 coroutineScope {
-	val a = async { fetchPrice() }    // 시작만 하고 다음 줄로
+	val a = async { fetchPrice() }   // 시작만 하고 바로 다음 줄
 	val b = async { fetchPrice() }
-	a.await() + b.await()             // 둘 다 끝나길 기다림
+	a.await() + b.await()            // 결과가 필요한 시점에 기다린다
 }
 ```
+**흔한 실수**: `async { … }.await()`를 바로 이어 쓰면 동시에 실행되지 않는다(시작하자마자 기다리므로 순차와 같다). `async` 두 개를 **먼저 다 띄운 뒤** `await`해야 한다.
 
-| 빌더/함수 | 쉽게 말하면 | 반환 |
-|---|---|---|
-| `launch { }` | "이 일 시작해 줘" (결과 필요 없음) | `Job` |
-| `async { }` | "이 일 시작하고 결과는 나중에 줘" | `Deferred<T>` → `await()` |
-| `coroutineScope { }` | 안에서 시작한 일이 **모두 끝나야** 빠져나온다 | 블록 결과 |
-| `withContext(Dispatchers.IO) { }` | 이 블록은 다른 스레드 풀에서 실행 | 블록 결과 |
-| `runBlocking { }` | 일반 코드에서 코루틴을 시작하고 끝날 때까지 **스레드를 막고** 기다림 | main, 테스트 외에는 쓰지 않는다 |
+### 15-4. 구조적 동시성 — 부모가 자식을 책임진다
 
-### 15-3. 구조적 동시성 (Structured Concurrency)
+코루틴은 **부모-자식 관계**를 가진다. 세 가지 규칙만 기억하면 된다.
+1. 부모(`coroutineScope`)는 **자식이 모두 끝나야** 빠져나온다.
+2. 자식 하나가 **실패하면 형제들이 취소되고**, 예외는 부모로 올라온다.
+3. 부모가 취소되면 **자식도 모두 취소**된다.
 
-**쉽게 말하면**: 코루틴은 **부모-자식 관계**를 가진다.
-- 부모는 자식이 **모두 끝날 때까지** 기다린다.
-- 자식 하나가 **실패하면 형제들은 취소되고** 예외는 부모로 전달된다.
-- 부모가 취소되면 자식도 모두 취소된다.
+```kotlin
+coroutineScope {
+	launch { delay(10_000); "끝까지 실행" }        // ← 취소된다
+	launch { delay(100); throw IllegalStateException() }
+}   // IllegalStateException이 여기서 던져진다
+```
+Java에서 `ExecutorService`로 작업 두 개를 띄웠다가 하나가 실패하면 나머지를 직접 `cancel`하고 예외를 모아야 했던 일을 언어가 대신 해 준다. 테스트에서 형제가 `"취소됨"`으로 정리되는 것을 확인했다.
 
-Java에서 스레드를 여러 개 띄웠다가 하나가 실패하면 나머지를 직접 정리해야 했던 문제를 언어 차원에서 해결한다. `CoroutineBasicsTest`의 `자식 하나가 실패하면…` 테스트에서 형제가 `"취소됨"`으로 끝나는 것을 확인했다.
+> **`GlobalScope.launch`는 쓰지 않는다.** 부모가 없어서 이 보호를 받지 못하고, 앱이 종료돼도 남는다.
 
-> `GlobalScope.launch { }`는 부모가 없는 코루틴이라 이 보호를 받지 못한다. 실무 코드에서는 쓰지 않는다.
+### 15-5. 취소와 타임아웃
 
-### 15-4. Dispatcher — 어느 스레드에서 실행할까
+```kotlin
+val job = launch { … }
+job.cancel()                       // 취소 요청
+job.join()                         // 끝날 때까지 대기 (cancelAndJoin()으로 한 번에)
 
-| Dispatcher | 용도 |
+withTimeout(3_000) { fetchPrice() }        // 3초 넘으면 TimeoutCancellationException
+withTimeoutOrNull(3_000) { fetchPrice() }  // 3초 넘으면 null
+```
+- **취소는 협조적이다.** `delay`, `await` 같은 suspend 지점에서만 실제로 멈춘다. CPU만 도는 루프는 `ensureActive()`나 `isActive` 검사를 넣어야 멈춘다.
+- 정리 코드는 `try { … } finally { … }`에 둔다. 취소된 코루틴 안에서 다시 suspend 함수를 부르려면 `withContext(NonCancellable)`이 필요하다.
+
+### 15-6. 예외 처리
+
+| 상황 | 동작 |
 |---|---|
-| `Dispatchers.Default` | CPU 계산 (정렬, 변환). 코어 수만큼의 스레드 |
-| `Dispatchers.IO` | **블로킹 I/O** (JDBC/JPA, 파일, 블로킹 HTTP 클라이언트). 많은 스레드 |
-| `Dispatchers.Main` | 안드로이드 UI 스레드 (서버에서는 사용하지 않음) |
+| `coroutineScope` 안의 자식 예외 | **부모로 전파** → 바깥에서 `try/catch`로 잡을 수 있다 |
+| `async`의 예외 | `await()`를 부를 때 던져진다 |
+| `supervisorScope` | 자식 하나가 실패해도 **형제는 계속** (독립적인 작업들에 사용) |
+| `launch` + `CoroutineExceptionHandler` | 최상위 코루틴의 처리되지 않은 예외를 받는다 |
 
-**핵심 규칙**: JPA/JDBC는 스레드를 붙잡는 블로킹 호출이다. 코루틴 안에서 부를 때는 `withContext(Dispatchers.IO)` 또는 `async(Dispatchers.IO)`로 IO 스레드에서 실행한다.
+```kotlin
+try {
+	coroutineScope { launch { throw IllegalStateException("실패") } }
+} catch (e: IllegalStateException) { /* 여기서 잡힌다 */ }
+```
 
-### 15-5. Spring에서 쓰기
+### 15-7. Dispatcher — 어느 스레드에서 돌릴까
 
-**suspend 컨트롤러** — Spring MVC도 지원한다(`kotlinx-coroutines-reactor` 필요).
+| Dispatcher | 용도 | 스레드 수 |
+|---|---|---|
+| `Dispatchers.Default` | CPU 계산(정렬, 변환, 암호화) | 코어 수 |
+| `Dispatchers.IO` | **블로킹 I/O** — JDBC/JPA, 파일, 블로킹 HTTP | 많다(기본 64+) |
+| `Dispatchers.Main` | 안드로이드 UI | 서버에서는 사용 안 함 |
+
+```kotlin
+withContext(Dispatchers.IO) { bookRepository.findAll() }   // 블로킹 호출은 IO에서
+```
+- **규칙**: JPA/JDBC는 스레드를 붙잡는 블로킹 호출이다. 코루틴 안에서 부를 때는 `Dispatchers.IO`로 보낸다. 그러지 않으면 `Default`의 적은 스레드를 막아 전체가 느려진다.
+- `withContext`는 **스레드를 바꾼다.** 이것이 §15-9의 트랜잭션 함정으로 이어진다.
+
+### 15-8. Spring에서 쓰기
+
+**suspend 컨트롤러** (Spring MVC도 지원, `kotlinx-coroutines-reactor` 필요)
 ```kotlin
 @GetMapping("/api/dashboard")
 suspend fun dashboard(): DashboardResponse = dashboardService.getDashboard()
 ```
+- 요청 스레드가 응답까지 붙잡히지 않고, 코루틴이 끝나면 비동기로 응답이 나간다.
+- 테스트에서는 비동기 처리라 `asyncStarted()` 확인 후 `asyncDispatch()`로 결과를 받는다.
 
 **서로 관계없는 조회를 동시에** (`DashboardService`)
 ```kotlin
@@ -1222,55 +1287,69 @@ suspend fun getDashboard(): DashboardResponse = coroutineScope {
 	DashboardResponse(typeCounts.await(), authorCounts.await())
 }
 ```
-- **실측**: 각각 300ms 걸리는 조회 두 개를 **307ms**에 끝냈다(`DashboardServiceTest`). 순서대로였다면 600ms 이상이다.
-- **테스트**: suspend 컨트롤러는 MockMvc에서 비동기로 처리되므로 `asyncStarted()` 확인 후 `asyncDispatch()`로 결과를 검증한다(`DashboardControllerTest`).
+**실측**: 각각 300ms 걸리는 조회 두 개가 **307ms**에 끝났다(순차라면 600ms 이상).
 
-### 15-6. ⚠️ 코루틴 + JPA/트랜잭션 함정
+### 15-9. ⚠️ 코루틴 + JPA/트랜잭션 함정 (가장 중요)
 
 **스프링 트랜잭션은 스레드(ThreadLocal)에 묶여 있다.** 코루틴이 다른 스레드로 넘어가면 트랜잭션이 따라가지 않는다.
 
 ```kotlin
 tx.executeWithoutResult {
-	isActualTransactionActive()                                    // true
+	isActualTransactionActive()                                                  // true
 	runBlocking { withContext(Dispatchers.IO) { isActualTransactionActive() } }   // false!
 }
 ```
-테스트(`CoroutineTransactionTest`)로 확인했다. 다른 스레드에서 한 엔티티 변경은 **변경 감지·롤백 대상이 아니다.**
+테스트(`CoroutineTransactionTest`)로 확인했다. 다른 스레드에서 한 엔티티 변경은 **변경 감지도, 롤백도 되지 않는다.**
 
-**그래서 이렇게 한다**
-1. `@Transactional` 메소드 **안에서** 코루틴으로 스레드를 바꾸지 않는다.
-2. 동시 실행이 필요하면 `DashboardService`처럼 **바깥(트랜잭션 없는 곳)에서 코루틴을 쓰고**, 각 작업이 **각자의 트랜잭션**을 가진 서비스 메소드를 부르게 한다.
-3. 영속성 컨텍스트(EntityManager)는 스레드 안전하지 않다. **엔티티 객체를 코루틴 사이에 넘기지 말고** DTO를 넘긴다.
-4. 완전한 논블로킹이 필요하면 JPA 대신 **R2DBC**(Spring Data R2DBC)를 쓴다. 이 경우 `@Transactional`도 코루틴을 지원한다.
+**규칙 4가지**
+1. `@Transactional` 메소드 **안에서** `withContext`/`async`로 스레드를 바꾸지 않는다.
+2. 동시 실행이 필요하면 **트랜잭션 바깥**에서 코루틴을 쓰고, 각 작업이 **자기 트랜잭션을 가진 서비스 메소드**를 부르게 한다(`DashboardService` 방식).
+3. **엔티티를 코루틴 사이로 넘기지 않는다.** 영속성 컨텍스트는 스레드 안전하지 않다 → DTO를 넘긴다.
+4. 완전한 논블로킹이 필요하면 JPA 대신 **R2DBC**를 쓴다(이 경우 `@Transactional`도 코루틴을 지원).
 
-### 15-7. 언제 코루틴을 쓸까?
+### 15-10. 언제 쓰고, 언제 안 쓰나
 
 | 상황 | 권장 |
 |---|---|
-| 평범한 CRUD API (DB 1~2번 호출) | **코루틴 불필요.** 일반 함수로 충분하다 |
-| 서로 관계없는 외부 API·조회 여러 개를 모아 응답 | ✅ `async`로 동시에 |
-| 외부 API를 많이 호출하는 서비스 (WebClient) | ✅ suspend + `awaitBody()` |
-| 대량 동시 연결 (채팅, 스트리밍) | ✅ WebFlux + 코루틴 + `Flow` |
-| "스레드가 모자라서" 동시 처리량을 올리고 싶다 | JDK 21+ **가상 스레드**(`spring.threads.virtual.enabled=true`)도 검토한다. 기존 블로킹 코드를 거의 그대로 둘 수 있다 |
+| 평범한 CRUD API (DB 1~2번) | **쓰지 않는다.** 일반 함수가 더 단순하고 안전하다 |
+| 관계없는 조회·외부 API 여러 개를 모아 응답 | ✅ `async`로 동시에 |
+| 외부 API 호출이 많은 서비스 | ✅ suspend + WebClient `awaitBody()` |
+| 대량 동시 연결(채팅·스트리밍) | ✅ WebFlux + 코루틴 + `Flow` |
+| "스레드가 모자라 처리량이 안 나온다" | JDK 21+ **가상 스레드**(`spring.threads.virtual.enabled=true`)도 검토. 기존 블로킹 코드를 거의 그대로 두고 효과를 본다 |
 
-### 15-8. 코루틴 테스트
+### 15-11. 테스트
 
 ```kotlin
 @Test
-fun `async로 동시에 부르면 1초`() = runTest {       // kotlinx-coroutines-test
+fun `동시에 부르면 1초`() = runTest {          // kotlinx-coroutines-test
 	val a = async { fetchPrice() }
 	val b = async { fetchPrice() }
 	a.await() + b.await()
-	assertThat(currentTime).isEqualTo(1_000)        // 가상 시간: 실제로 1초 기다리지 않는다
+	assertThat(currentTime).isEqualTo(1_000)   // 가상 시간: 실제로 기다리지 않는다
 }
 ```
-- `runTest`는 `delay`를 **가상 시간**으로 처리하므로 시간이 걸리는 코드도 순식간에 테스트된다.
-- MockK는 suspend 함수를 `coEvery { … } returns …`, `coVerify { … }`로 다룬다.
+- `runTest`는 `delay`를 **가상 시간**으로 처리한다 → 10초짜리 로직도 즉시 검증.
+- `currentTime`으로 "몇 초 걸렸나"를 단언할 수 있다.
+- **주의**: `Thread.sleep` 같은 진짜 블로킹은 가상 시간이 적용되지 않는다(`DashboardServiceTest`는 실제 시간을 잰다).
+- MockK는 suspend 함수를 `coEvery { } returns …`, `coVerify { }`로 다룬다.
 
-### 15-9. Flow (한 줄 소개)
-`Flow<T>`는 **값을 여러 번 흘려보내는 suspend 버전의 Stream**이다(`flow { emit(1); emit(2) }`). WebFlux 스트리밍 응답, 이벤트 처리에서 쓴다. MVC + JPA 위주의 팀이라면 처음에는 몰라도 된다.
+### 15-12. Flow — 값이 여러 번 흘러오는 경우
 
----
+```kotlin
+fun prices(): Flow<Int> = flow {
+	emit(100); delay(100); emit(200)      // 값을 여러 번 내보낸다
+}
+prices().map { it * 2 }.collect { println(it) }   // collect 할 때 실제로 실행된다(콜드 스트림)
+```
+- `suspend` 함수가 **값 하나**를 돌려준다면, `Flow`는 **여러 값을 시간에 걸쳐** 돌려준다. Java의 `Stream`에 suspend가 붙은 것, 또는 Reactor `Flux`의 코루틴 버전이라고 보면 된다.
+- 서버에서는 SSE·스트리밍 응답, 이벤트 처리에 쓴다. **MVC + JPA 위주 팀이라면 당장은 몰라도 된다.**
+
+### 15-13. 학습 순서 추천
+1. `CoroutineBasicsTest`를 열고 `delay` 값을 바꿔 가며 `currentTime`이 어떻게 변하는지 본다.
+2. `async` 두 개를 순서대로 `await`하도록 바꿔 보고 시간이 어떻게 달라지는지 확인한다.
+3. `자식 하나가 실패하면…` 테스트에서 `coroutineScope`를 `supervisorScope`로 바꿔 본다.
+4. `DashboardService`의 `async(Dispatchers.IO)`를 순차 호출로 바꿔 보고 `DashboardServiceTest`의 시간을 비교한다.
+5. `CoroutineTransactionTest`로 트랜잭션이 스레드를 넘지 못하는 것을 눈으로 확인한다.
 
 ## 16. 팀 도구 · 컨벤션
 
@@ -1453,45 +1532,141 @@ fun <T> withLock(key: String, ttl: Duration = Duration.ofSeconds(10), action: ()
 
 ## 21. 컨테이너와 쿠버네티스
 
-### 21-1. Dockerfile (JVM)
-```dockerfile
-FROM eclipse-temurin:25-jdk AS build
-… ./gradlew bootJar -x test
+> Spring Boot 서비스 한 개를 쿠버네티스에서 운영한다는 가정으로, 필요한 개념을 순서대로 정리한다.
+> 매니페스트 예제는 `deploy/`에 있고 `helm lint` · `kubeconform` 검증을 마쳤다.
 
-FROM eclipse-temurin:25-jre         # 실행은 JRE로 (이미지 크기 ↓)
-RUN useradd -r -u 1001 app
-USER 1001                            # root로 실행하지 않는다
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=70", "-jar", "/app/app.jar"]
-```
-- **`-Xmx` 대신 `-XX:MaxRAMPercentage`**: 컨테이너 메모리 limit에 맞춰 힙이 정해진다.
-- 의존성 파일(`build.gradle.kts`)을 소스보다 먼저 복사하면 레이어 캐시가 살아 빌드가 빨라진다.
-- 대안: Spring Boot의 `bootBuildImage`(Buildpacks), Jib — Dockerfile 없이 이미지를 만든다.
+### 21-1. 큰 그림 — 요청이 내 코드까지 오는 길
 
-### 21-2. 프로브 (스프링 부트 액추에이터)
-```yaml
-management.endpoint.health.probes.enabled: true   # /actuator/health/liveness · /readiness
 ```
-| 프로브 | 뜻 | 실패하면 |
+사용자 → [DNS] → 클라우드 LB → Ingress(nginx) → Service → Pod(컨테이너: Spring Boot)
+                                                    ↑
+                                    Deployment가 Pod 개수를 유지하고 교체한다
+```
+
+| 오브젝트 | 한 줄 설명 | Spring Boot 운영에서 |
 |---|---|---|
-| `startupProbe` | 기동이 끝났나 | 기동 중에는 다른 프로브를 시작하지 않는다. **JVM처럼 느린 앱에 필수** |
-| `readinessProbe` | 트래픽 받을 준비가 됐나 | Service에서 빠진다(재시작 X) |
-| `livenessProbe` | 살아 있나 | **재시작**한다 |
+| **Pod** | 컨테이너 1개 이상을 담는 **가장 작은 배포 단위**. IP를 가진다 | 앱 인스턴스 1개 = Pod 1개 |
+| **ReplicaSet** | Pod를 지정한 개수만큼 유지 | 직접 만들지 않는다(Deployment가 만든다) |
+| **Deployment** | ReplicaSet을 관리하며 **롤링 업데이트·롤백**을 담당 | 우리가 작성하는 핵심 리소스 |
+| **Service** | 여러 Pod 앞의 **고정 주소 + 로드밸런싱** | Pod가 죽고 새로 떠도 주소가 그대로 |
+| **Ingress** | HTTP 경로/호스트 기준 외부 노출 + TLS | `api.example.com → Service` |
+| **ConfigMap / Secret** | 설정값 / 비밀값을 컨테이너에 주입 | `SPRING_*` 환경변수, DB 비밀번호 |
+| **Namespace** | 논리적 격리 단위 | `library-dev`, `library-prod` |
+| **HPA** | 부하에 따라 Pod 수 자동 조절 | CPU 70% 기준 등 |
+| **PDB** | 노드 작업 중에도 **최소 가동 수 보장** | 최소 1대 유지 |
+| **ServiceAccount / RBAC** | Pod의 신원과 권한 | 보통 기본값 + 필요 시 최소 권한 |
+| **PVC/StatefulSet** | 영속 스토리지 / 상태 있는 워크로드 | 앱은 무상태로 두고 DB는 매니지드 서비스 권장 |
 
-- liveness에 DB 체크를 넣지 않는다. DB가 잠깐 느리면 **전체 파드가 재시작 루프**에 빠진다.
-- 무중단 종료: `preStop`으로 몇 초 쉬고(`sleep 5`) `terminationGracePeriodSeconds`를 충분히 준다. 스프링의 `server.shutdown=graceful`과 함께 쓴다.
+### 21-2. 라벨과 셀렉터 (모든 연결의 기본)
+쿠버네티스는 이름이 아니라 **라벨**로 대상을 찾는다.
+```yaml
+# Deployment
+selector: { matchLabels: { app.kubernetes.io/name: library-api } }   # 이 라벨을 가진 Pod를 관리
+# Service
+selector: { app.kubernetes.io/name: library-api }                    # 이 라벨의 Pod로 트래픽
+```
+- 권장 라벨: `app.kubernetes.io/name`, `instance`, `version`, `managed-by` (차트의 `_helpers.tpl`에서 한 번에 생성).
+- **Deployment의 `selector`는 생성 후 변경할 수 없다.** 버전 같은 자주 바뀌는 값을 넣지 않는다.
 
-### 21-3. 리소스 · 스케일
-
-| 항목 | 권장 |
+### 21-3. 컨테이너 이미지 (JVM 관점)
+```dockerfile
+FROM eclipse-temurin:25-jdk AS build      # 빌드 단계
+…
+FROM eclipse-temurin:25-jre               # 실행 단계(JRE로 작게)
+USER 1001                                  # root 금지
+ENTRYPOINT ["java","-XX:MaxRAMPercentage=70","-jar","/app/app.jar"]
+```
+| 항목 | 이유 |
 |---|---|
-| memory request = limit | JVM은 예측 가능하게. OOMKilled를 피한다 |
-| **CPU limit은 두지 않기** | CPU 스로틀링으로 지연이 튄다. request만 지정 |
-| HPA | CPU 기준으로 시작. `replicas`는 **템플릿에서 빼야** HPA와 충돌하지 않는다 |
-| PodDisruptionBudget | 노드 교체 중에도 최소 대수 유지 |
-| RollingUpdate | `maxUnavailable: 0`, `maxSurge: 1` → 새 파드가 준비된 뒤 옛 파드 종료 |
-| ConfigMap 변경 | 파드는 자동 재시작되지 않는다 → **체크섬 어노테이션**으로 재시작 유도 |
+| **`-XX:MaxRAMPercentage`** | 컨테이너 메모리 limit 기준으로 힙을 잡는다. `-Xmx` 하드코딩은 limit 변경 시 어긋난다 |
+| 멀티 스테이지 | 빌드 도구가 최종 이미지에 남지 않는다 |
+| 레이어 캐시 | 의존성 파일을 소스보다 먼저 COPY |
+| 태그 | `latest` 금지 → 커밋 SHA. 롤백·추적이 가능해진다 |
+| 대안 | `./gradlew bootBuildImage`(Buildpacks), Jib — Dockerfile 없이 |
 
----
+### 21-4. 설정과 비밀값 (12-factor)
+- 코드에 환경별 값을 넣지 않는다. **ConfigMap → 환경변수**로 주입한다.
+- 스프링은 환경변수를 프로퍼티로 읽는다: `SPRING_DATASOURCE_URL` → `spring.datasource.url`.
+- 프로파일은 `SPRING_PROFILES_ACTIVE=prod`.
+- **Secret은 base64일 뿐 암호화가 아니다.** Git에 넣지 않는다. 운영에서는 External Secrets Operator, Sealed Secrets, 클라우드 시크릿 매니저를 쓴다.
+- ConfigMap을 바꿔도 **Pod는 자동 재시작되지 않는다** → 차트의 `checksum/config` 어노테이션으로 재시작을 유도한다.
+
+### 21-5. 프로브 3종 (Spring Boot Actuator)
+```yaml
+management.endpoint.health.probes.enabled: true  # /actuator/health/liveness · /readiness
+```
+| 프로브 | 질문 | 실패하면 | 스프링 엔드포인트 |
+|---|---|---|---|
+| **startupProbe** | 기동이 끝났나? | 다른 프로브를 아직 시작하지 않는다 | `/actuator/health/readiness` |
+| **readinessProbe** | 트래픽 받을 준비가 됐나? | **Service에서 제외**(재시작 X) | `/actuator/health/readiness` |
+| **livenessProbe** | 살아 있나? | **컨테이너 재시작** | `/actuator/health/liveness` |
+
+- JVM은 기동이 느리다 → **startupProbe 필수**(`failureThreshold × periodSeconds`만큼 시간을 준다).
+- **liveness에 DB 체크를 넣지 않는다.** DB가 잠깐 느리면 모든 Pod가 재시작 루프에 빠진다. 스프링은 기본적으로 readiness에 외부 의존성 상태를 반영한다.
+
+### 21-6. 무중단 배포 (그레이스풀 셧다운)
+```
+새 Pod 뜸 → readiness 통과 → Service에 등록 → 옛 Pod에 SIGTERM
+   → preStop(sleep 5): LB에서 빠지는 시간 → 처리 중 요청 마무리 → 종료
+```
+```yaml
+strategy: { rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }
+lifecycle: { preStop: { exec: { command: ["sh","-c","sleep 5"] } } }
+terminationGracePeriodSeconds: 40
+```
+스프링 쪽: `server.shutdown: graceful`, `spring.lifecycle.timeout-per-shutdown-phase: 20s`.
+- 배포 중 간헐적 502는 대부분 **"Pod는 이미 죽었는데 LB가 아직 보내는"** 타이밍 문제다 → `preStop` 대기로 해결.
+- 롤백: `kubectl rollout undo deployment/…` (GitOps라면 Git revert).
+
+### 21-7. 리소스와 스케줄링
+| 개념 | 내용 |
+|---|---|
+| **requests** | 스케줄러가 "이만큼 여유 있는 노드"를 고르는 기준. 실제 보장량 |
+| **limits** | 넘으면 메모리는 **OOMKilled**, CPU는 **스로틀링** |
+| QoS | requests=limits면 `Guaranteed`(우선 보호), 다르면 `Burstable` |
+| 권장(JVM) | memory requests = limits (예측 가능), **CPU limit은 두지 않기**(지연 튐 방지), CPU requests만 지정 |
+| 사이징 | 힙 + 메타스페이스 + 스레드 스택 + 네이티브 버퍼를 고려해 컨테이너 메모리는 힙의 약 1.4배 |
+| 배치 제약 | `nodeSelector`, `affinity`, `topologySpreadConstraints`(AZ 분산), `taint/toleration` |
+
+### 21-8. 스케일링
+- **HPA**: CPU/메모리 또는 커스텀 메트릭 기준으로 Pod 수를 조절. HPA를 쓰면 **Deployment에 `replicas`를 두지 않는다**(서로 덮어쓴다).
+- 메트릭 서버(`metrics-server`)가 있어야 CPU 기반 HPA가 동작한다.
+- **KEDA**: Kafka 컨슈머 랙, 큐 길이 같은 **이벤트 기준** 스케일링.
+- **Cluster Autoscaler**: Pod가 `Pending`이면 노드를 늘린다.
+- JVM 특성상 스케일 아웃 직후 워밍업(JIT) 구간이 있다 → HPA `stabilizationWindow`와 startupProbe를 넉넉히.
+
+### 21-9. 로그·디버깅 명령 모음
+| 하고 싶은 것 | 명령 |
+|---|---|
+| Pod 상태 | `kubectl get pods -l app.kubernetes.io/name=library-api` |
+| 왜 안 뜨나 | `kubectl describe pod <pod>` (Events 섹션이 핵심) |
+| 로그 | `kubectl logs -f <pod>` / 이전 컨테이너 `--previous` |
+| 컨테이너 진입 | `kubectl exec -it <pod> -- sh` |
+| 로컬 포트 연결 | `kubectl port-forward svc/library-api 8080:80` |
+| 리소스 사용량 | `kubectl top pod` |
+| 배포 상태·롤백 | `kubectl rollout status/undo deployment/library-api` |
+| 임시 디버그 컨테이너 | `kubectl debug -it <pod> --image=busybox` |
+
+로그는 **파일이 아니라 표준출력(stdout)** 으로 내보낸다(JSON 권장) → Loki/ELK가 수집.
+
+### 21-10. 장애 증상별 원인 찾기
+| 증상 | 흔한 원인 | 확인 |
+|---|---|---|
+| `ImagePullBackOff` | 이미지 태그 오타, 레지스트리 인증 없음 | `describe pod` Events |
+| `CrashLoopBackOff` | 기동 중 예외, liveness 과민 설정 | `logs --previous` |
+| `OOMKilled` | 힙+네이티브가 limit 초과 | `describe pod`의 Last State, `MaxRAMPercentage` 조정 |
+| `Pending` | 노드 리소스 부족, PVC 미바인딩 | `describe pod` Events |
+| 준비 안 됨(0/1 Running) | readiness 실패(DB 연결 등) | `/actuator/health/readiness` 직접 호출 |
+| 배포 중 502 | preStop·graceful 부족 | §21-6 |
+| 간헐 504 | 앱 느림 또는 ingress 타임아웃 | p95 지표 + `proxy-read-timeout` |
+
+### 21-11. 그 밖에 알아두면 좋은 것
+- **Job / CronJob**: 배치 작업. 스프링 배치를 CronJob으로 돌리는 경우가 많다.
+- **StatefulSet**: 순서·고정 식별자가 필요한 워크로드(Kafka, DB). **앱은 무상태로** 두는 것이 원칙.
+- **NetworkPolicy**: Pod 간 통신 제한(기본은 모두 허용).
+- **RBAC / ServiceAccount**: Pod가 쿠버네티스 API를 쓸 때만 권한이 필요하다. 보통 앱은 기본 SA로 충분.
+- **멀티 환경**: 네임스페이스 분리 + Helm values 분리 + ArgoCD ApplicationSet(§23).
+- **보안 기본**: non-root 실행, `readOnlyRootFilesystem`, 이미지 취약점 스캔(Trivy), `securityContext` 설정.
 
 ## 22. Helm 차트
 
