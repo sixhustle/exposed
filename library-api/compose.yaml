@@ -1,0 +1,14 @@
+services:
+  mysql:
+    image: 'mysql:8.4'
+    environment:
+      - 'MYSQL_DATABASE=library'
+      - 'MYSQL_USER=library'
+      - 'MYSQL_PASSWORD=library'
+      - 'MYSQL_ROOT_PASSWORD=root'
+      - 'TZ=UTC'
+    command:
+      - '--character-set-server=utf8mb4'
+      - '--collation-server=utf8mb4_0900_ai_ci'
+    ports:
+      - '3306:3306'

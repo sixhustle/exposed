@@ -1,0 +1,61 @@
+spring:
+  application:
+    name: library-api
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  cache:
+    type: redis
+
+  # 로컬: Docker가 켜져 있으면 spring-boot-docker-compose가 compose.yaml의 MySQL을 띄우고 접속 정보를 자동 주입한다.
+  # 아래 datasource는 Docker Compose 없이 직접 띄운 MySQL에 붙을 때 사용된다.
+  datasource:
+    url: jdbc:mysql://localhost:3306/library?serverTimezone=UTC&characterEncoding=UTF-8
+    username: library
+    password: library
+
+  jpa:
+    open-in-view: false # 트랜잭션 밖(Controller/JSON 직렬화)에서 LAZY 로딩이 일어나지 않게 한다
+    hibernate:
+      ddl-auto: update # 로컬 학습용. 운영은 validate 또는 none + Flyway/Liquibase로 스키마 관리
+    properties:
+      hibernate:
+        format_sql: true
+        default_batch_fetch_size: 100 # LAZY 컬렉션/연관 엔티티를 IN 쿼리로 묶어 N+1 완화
+        jdbc:
+          time_zone: UTC
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+app:
+  kafka:
+    listener-enabled: true
+
+# 쿠버네티스 프로브 · Prometheus 메트릭
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true # /actuator/health/liveness · /readiness
+      show-details: when-authorized
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+  metrics:
+    tags:
+      application: library-api
+
+logging:
+  level:
+    org.hibernate.SQL: debug
+    org.hibernate.orm.jdbc.bind: trace # 바인딩 파라미터 값 출력
