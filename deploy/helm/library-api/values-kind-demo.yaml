@@ -1,0 +1,19 @@
+# kind 데모용: 외부 의존성 없이 H2로 띄운다
+replicaCount: 2
+image: { repository: library-api, tag: demo, pullPolicy: IfNotPresent }
+ingress: { enabled: false }
+autoscaling: { enabled: false }
+serviceMonitor: { enabled: false }   # Prometheus Operator가 없는 클러스터
+existingSecret: library-api-secrets   # 사용자/비밀번호는 Secret에서
+resources:
+  requests: { cpu: 200m, memory: 768Mi }
+  limits: { memory: 768Mi }
+config:
+  SPRING_PROFILES_ACTIVE: demo
+  SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/library?serverTimezone=UTC&characterEncoding=UTF-8"   # 서비스 이름이 곧 호스트명
+  SPRING_JPA_HIBERNATE_DDL_AUTO: update
+  SPRING_CACHE_TYPE: none
+  APP_KAFKA_ENABLED: "false"
+  APP_KAFKA_LISTENER_ENABLED: "false"
+  SPRING_DOCKER_COMPOSE_ENABLED: "false"
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=70 -Duser.timezone=UTC"

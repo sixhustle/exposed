@@ -31,6 +31,7 @@
 19. [Kafka](#19-kafka)
 20. [Redis](#20-redis)
 21. [컨테이너와 쿠버네티스](#21-컨테이너와-쿠버네티스)
+21B. [Spring Boot를 쿠버네티스에서 운영할 때](#21b-spring-boot를-쿠버네티스에서-운영할-때-앱-쪽-튜닝)
 22. [Helm 차트](#22-helm-차트)
 23. [ArgoCD (GitOps)](#23-argocd-gitops)
 24. [Prometheus · Grafana](#24-prometheus--grafana)
@@ -1532,81 +1533,162 @@ fun <T> withLock(key: String, ttl: Duration = Duration.ofSeconds(10), action: ()
 
 ## 21. 컨테이너와 쿠버네티스
 
-> Spring Boot 서비스 한 개를 쿠버네티스에서 운영한다는 가정으로, 필요한 개념을 순서대로 정리한다.
-> 매니페스트 예제는 `deploy/`에 있고 `helm lint` · `kubeconform` 검증을 마쳤다.
+> Spring Boot 서비스를 쿠버네티스에서 운영하는 데 필요한 개념을 처음부터 정리한다.
+> 매니페스트는 `deploy/`에 있고 `helm lint` · `kubeconform` 검증을 마쳤다.
 
-### 21-1. 큰 그림 — 요청이 내 코드까지 오는 길
+### 21-1. 쿠버네티스를 한 문장으로
+
+**"원하는 상태(desired state)를 선언하면, 컨트롤러가 현재 상태를 계속 그 상태로 맞춘다."**
 
 ```
-사용자 → [DNS] → 클라우드 LB → Ingress(nginx) → Service → Pod(컨테이너: Spring Boot)
-                                                    ↑
-                                    Deployment가 Pod 개수를 유지하고 교체한다
+kubectl apply -f deployment.yaml     # "이 이미지로 3대 띄워 줘" (원하는 상태를 etcd에 기록)
+        ↓
+컨트롤러가 현재 상태를 관찰 → 차이가 있으면 조치 (reconciliation loop)
+        ↓
+Pod 2대뿐 → 1대 더 생성 / 노드가 죽음 → 다른 노드에 다시 생성
 ```
+- **명령형이 아니라 선언형이다.** "컨테이너를 실행하라"가 아니라 "3대가 떠 있어야 한다"를 적는다. 그래서 장애가 나면 사람이 개입하지 않아도 복구된다.
+- 이 한 가지 원리가 Deployment, HPA, ArgoCD(§23)까지 그대로 적용된다.
 
-| 오브젝트 | 한 줄 설명 | Spring Boot 운영에서 |
+### 21-2. 클러스터 구조
+
+| 구성 요소 | 하는 일 | 알아야 할 이유 |
 |---|---|---|
-| **Pod** | 컨테이너 1개 이상을 담는 **가장 작은 배포 단위**. IP를 가진다 | 앱 인스턴스 1개 = Pod 1개 |
-| **ReplicaSet** | Pod를 지정한 개수만큼 유지 | 직접 만들지 않는다(Deployment가 만든다) |
-| **Deployment** | ReplicaSet을 관리하며 **롤링 업데이트·롤백**을 담당 | 우리가 작성하는 핵심 리소스 |
-| **Service** | 여러 Pod 앞의 **고정 주소 + 로드밸런싱** | Pod가 죽고 새로 떠도 주소가 그대로 |
-| **Ingress** | HTTP 경로/호스트 기준 외부 노출 + TLS | `api.example.com → Service` |
-| **ConfigMap / Secret** | 설정값 / 비밀값을 컨테이너에 주입 | `SPRING_*` 환경변수, DB 비밀번호 |
-| **Namespace** | 논리적 격리 단위 | `library-dev`, `library-prod` |
-| **HPA** | 부하에 따라 Pod 수 자동 조절 | CPU 70% 기준 등 |
-| **PDB** | 노드 작업 중에도 **최소 가동 수 보장** | 최소 1대 유지 |
-| **ServiceAccount / RBAC** | Pod의 신원과 권한 | 보통 기본값 + 필요 시 최소 권한 |
-| **PVC/StatefulSet** | 영속 스토리지 / 상태 있는 워크로드 | 앱은 무상태로 두고 DB는 매니지드 서비스 권장 |
+| **API Server** | 모든 요청의 관문(kubectl, 컨트롤러 모두 여기로) | 권한 오류·어드미션 거부가 여기서 난다 |
+| **etcd** | 클러스터의 상태 저장소(단일 진실 공급원) | 백업 대상. 우리가 직접 만질 일은 없다 |
+| **Scheduler** | 새 Pod를 어느 노드에 둘지 결정 | `Pending`의 원인(리소스 부족·제약 불충족)을 이해하려면 |
+| **Controller Manager** | Deployment/ReplicaSet 등 컨트롤러 실행 | 롤링 업데이트가 "왜 저렇게" 진행되는지 |
+| **kubelet** (각 노드) | Pod를 실제로 띄우고 **프로브를 실행** | 프로브 실패·재시작은 kubelet이 한다 |
+| **kube-proxy / CNI** | Service 가상 IP 처리 / Pod 네트워크 | Service가 왜 IP 하나로 동작하는지 |
 
-### 21-2. 라벨과 셀렉터 (모든 연결의 기본)
-쿠버네티스는 이름이 아니라 **라벨**로 대상을 찾는다.
+```
+[Control Plane]  API Server ── etcd
+                    │  Scheduler · Controller Manager
+                    ↓
+[Worker Node]    kubelet → containerd → Pod(컨테이너)
+                 kube-proxy (Service 라우팅)
+```
+
+### 21-3. 모든 매니페스트의 공통 뼈대
 ```yaml
-# Deployment
-selector: { matchLabels: { app.kubernetes.io/name: library-api } }   # 이 라벨을 가진 Pod를 관리
-# Service
-selector: { app.kubernetes.io/name: library-api }                    # 이 라벨의 Pod로 트래픽
+apiVersion: apps/v1        # 이 오브젝트를 다루는 API 그룹·버전
+kind: Deployment           # 종류
+metadata:
+  name: library-api        # 이름(네임스페이스 안에서 유일)
+  labels: { … }            # 검색·선택용 꼬리표
+spec:                      # 내가 "원하는 상태"
+  replicas: 3
+status:                    # 클러스터가 채우는 "현재 상태" (우리가 쓰지 않는다)
 ```
-- 권장 라벨: `app.kubernetes.io/name`, `instance`, `version`, `managed-by` (차트의 `_helpers.tpl`에서 한 번에 생성).
-- **Deployment의 `selector`는 생성 후 변경할 수 없다.** 버전 같은 자주 바뀌는 값을 넣지 않는다.
+- `kubectl apply`는 **선언형**(파일이 곧 상태), `kubectl create/edit/scale`은 명령형이다. GitOps(§23)를 쓰면 apply조차 사람이 하지 않는다.
+- `kubectl explain deployment.spec.strategy` 로 필드 설명을 그 자리에서 볼 수 있다.
 
-### 21-3. 컨테이너 이미지 (JVM 관점)
-```dockerfile
-FROM eclipse-temurin:25-jdk AS build      # 빌드 단계
-…
-FROM eclipse-temurin:25-jre               # 실행 단계(JRE로 작게)
-USER 1001                                  # root 금지
-ENTRYPOINT ["java","-XX:MaxRAMPercentage=70","-jar","/app/app.jar"]
+### 21-4. 오브젝트 관계도 (Spring Boot 서비스 기준)
+
 ```
-| 항목 | 이유 |
+Ingress(호스트·경로·TLS)
+   └→ Service(고정 주소, 로드밸런싱)
+        └→ Pod × N  ← ReplicaSet ← Deployment(버전 교체·롤백)
+              ├ ConfigMap/Secret (환경변수)
+              ├ ServiceAccount (신원)
+              └ 컨테이너: Spring Boot (프로브 · 리소스)
+   HPA → Deployment의 replicas 조절        PDB → 동시에 못 내리는 최소 대수
+```
+
+### 21-5. 워크로드 종류 — 무엇을 쓸까
+
+| 종류 | 특징 | Spring Boot에서 |
+|---|---|---|
+| **Deployment** | 무상태 앱, 순서 없음, 롤링 업데이트 | **API 서버는 대부분 이것** |
+| StatefulSet | 고정 이름·순서·전용 볼륨 | Kafka·DB 같은 상태 저장 시스템(보통 매니지드 서비스 사용) |
+| DaemonSet | 노드마다 1개 | 로그 수집기, 노드 에이전트 |
+| Job / CronJob | 한 번 실행 / 주기 실행 | 배치, 마이그레이션, 정산 |
+| ReplicaSet | Pod 개수 유지 | 직접 만들지 않는다(Deployment가 생성) |
+
+- **앱은 무상태로 유지한다.** 세션·캐시는 Redis로, 파일은 오브젝트 스토리지로 빼면 Pod를 언제든 죽이고 늘릴 수 있다.
+- 배치는 `Job`/`CronJob` + `concurrencyPolicy: Forbid`로 중복 실행을 막는다.
+
+### 21-6. 네트워킹
+
+**Service 4종**
+
+| 타입 | 접근 범위 | 용도 |
+|---|---|---|
+| **ClusterIP**(기본) | 클러스터 내부 | 앱 → 앱 호출, Ingress의 백엔드 |
+| NodePort | 노드 IP:30000~ | 개발·디버깅 |
+| LoadBalancer | 클라우드 LB 생성 | Ingress 컨트롤러 앞단 |
+| ExternalName | 외부 DNS 별칭 | 외부 서비스를 내부 이름으로 |
+| (headless: `clusterIP: None`) | Pod IP 직접 | StatefulSet, 클라이언트 LB |
+
+**서비스 디스커버리 = DNS**
+```
+library-api                                → 같은 네임스페이스
+library-api.library                        → 다른 네임스페이스
+library-api.library.svc.cluster.local      → 전체 이름(FQDN)
+```
+Spring 설정에 `jdbc:mysql://mysql:3306/...`처럼 **서비스 이름을 그대로 호스트명으로** 쓴다.
+
+**그 밖에**
+- Service는 라벨로 Pod를 고르고, 준비된(ready) Pod만 **EndpointSlice**에 등록된다 → readiness가 트래픽 제어의 핵심.
+- **Ingress**는 L7(HTTP) 라우팅 + TLS. 차세대 표준은 **Gateway API**(Route 리소스 분리, 팀별 권한 분리에 유리).
+- **NetworkPolicy**: 기본은 모든 Pod가 서로 통신 가능. 정책을 만들면 그때부터 화이트리스트 방식이 된다(DB 접근을 앱 Pod로만 제한하는 식).
+
+### 21-7. 설정과 비밀값
+- ConfigMap → 환경변수(`envFrom`) 또는 파일 마운트. 스프링은 `SPRING_DATASOURCE_URL` → `spring.datasource.url`로 자동 매핑.
+- **Secret은 base64일 뿐 암호화가 아니다.** Git 금지 → External Secrets Operator / Sealed Secrets / 클라우드 시크릿 매니저.
+- ConfigMap을 바꿔도 **Pod는 재시작되지 않는다** → 차트의 `checksum/config` 어노테이션으로 유도(파일 마운트는 수 초 뒤 갱신되지만 스프링이 다시 읽지는 않는다).
+- 우선순위: 환경변수 > `application-{profile}.yml` > `application.yml`. 환경별 차이는 values로만 둔다.
+
+### 21-8. 스토리지 (앱은 무상태, 그래도 알아둘 것)
+
+| 개념 | 설명 |
 |---|---|
-| **`-XX:MaxRAMPercentage`** | 컨테이너 메모리 limit 기준으로 힙을 잡는다. `-Xmx` 하드코딩은 limit 변경 시 어긋난다 |
-| 멀티 스테이지 | 빌드 도구가 최종 이미지에 남지 않는다 |
-| 레이어 캐시 | 의존성 파일을 소스보다 먼저 COPY |
-| 태그 | `latest` 금지 → 커밋 SHA. 롤백·추적이 가능해진다 |
-| 대안 | `./gradlew bootBuildImage`(Buildpacks), Jib — Dockerfile 없이 |
+| **PV / PVC** | 실제 볼륨 / "이만큼 필요하다"는 요청서. Pod는 PVC를 마운트한다 |
+| **StorageClass** | 동적 프로비저닝 규칙(gp3, SSD 등). `ReadWriteOnce`가 일반적 |
+| emptyDir | Pod 수명과 함께 사라지는 임시 디렉터리(캐시·임시 파일) |
+| ConfigMap/Secret 볼륨 | 설정 파일을 파일로 마운트할 때 |
 
-### 21-4. 설정과 비밀값 (12-factor)
-- 코드에 환경별 값을 넣지 않는다. **ConfigMap → 환경변수**로 주입한다.
-- 스프링은 환경변수를 프로퍼티로 읽는다: `SPRING_DATASOURCE_URL` → `spring.datasource.url`.
-- 프로파일은 `SPRING_PROFILES_ACTIVE=prod`.
-- **Secret은 base64일 뿐 암호화가 아니다.** Git에 넣지 않는다. 운영에서는 External Secrets Operator, Sealed Secrets, 클라우드 시크릿 매니저를 쓴다.
-- ConfigMap을 바꿔도 **Pod는 자동 재시작되지 않는다** → 차트의 `checksum/config` 어노테이션으로 재시작을 유도한다.
+- **파일을 로컬 디스크에 쓰지 않는다.** 업로드는 S3 같은 오브젝트 스토리지로, 로그는 stdout으로.
 
-### 21-5. 프로브 3종 (Spring Boot Actuator)
+### 21-9. 스케줄링 — Pod가 어디에 뜨는가
+
+| 도구 | 용도 |
+|---|---|
+| `nodeSelector` / `nodeAffinity` | 특정 노드 그룹에 배치(예: `node-type: app`) |
+| `podAntiAffinity` | **같은 앱 Pod를 서로 다른 노드에** → 노드 한 대가 죽어도 살아남는다 |
+| `topologySpreadConstraints` | AZ·노드에 고르게 분산 |
+| `taints` / `tolerations` | 특별한 노드(GPU·스팟)에 아무나 못 오게 |
+| `PriorityClass` | 자원이 부족할 때 누가 먼저 밀려날지 |
+
+운영 API라면 최소한 **podAntiAffinity(또는 topologySpread) + PDB**는 넣는다.
+
+### 21-10. 보안 기본
+
+| 항목 | 내용 |
+|---|---|
+| **ServiceAccount** | Pod의 신원. 쿠버네티스 API를 쓰지 않으면 토큰 자동 마운트를 끈다(`automountServiceAccountToken: false`) |
+| **RBAC** | Role(네임스페이스) / ClusterRole + Binding으로 권한 부여. 앱보다 **CI·운영자 계정**에 더 중요 |
+| **securityContext** | `runAsNonRoot: true`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
+| **Pod Security Standards** | 네임스페이스 단위로 `restricted` 등 정책 강제 |
+| 이미지 | 태그 고정, 취약점 스캔(Trivy), 프라이빗 레지스트리 `imagePullSecrets` |
+| 어드미션 | OPA Gatekeeper·Kyverno로 "리소스 없는 배포 금지" 같은 규칙 강제 |
+
+### 21-11. 프로브 3종 (Spring Boot Actuator)
 ```yaml
-management.endpoint.health.probes.enabled: true  # /actuator/health/liveness · /readiness
+management.endpoint.health.probes.enabled: true   # /actuator/health/liveness · /readiness
 ```
-| 프로브 | 질문 | 실패하면 | 스프링 엔드포인트 |
-|---|---|---|---|
-| **startupProbe** | 기동이 끝났나? | 다른 프로브를 아직 시작하지 않는다 | `/actuator/health/readiness` |
-| **readinessProbe** | 트래픽 받을 준비가 됐나? | **Service에서 제외**(재시작 X) | `/actuator/health/readiness` |
-| **livenessProbe** | 살아 있나? | **컨테이너 재시작** | `/actuator/health/liveness` |
+| 프로브 | 질문 | 실패하면 |
+|---|---|---|
+| **startupProbe** | 기동이 끝났나? | 다른 프로브를 아직 시작하지 않는다 (JVM에 필수) |
+| **readinessProbe** | 트래픽 받을 준비가 됐나? | **EndpointSlice에서 제외**(재시작 X) |
+| **livenessProbe** | 살아 있나? | **컨테이너 재시작** |
 
-- JVM은 기동이 느리다 → **startupProbe 필수**(`failureThreshold × periodSeconds`만큼 시간을 준다).
-- **liveness에 DB 체크를 넣지 않는다.** DB가 잠깐 느리면 모든 Pod가 재시작 루프에 빠진다. 스프링은 기본적으로 readiness에 외부 의존성 상태를 반영한다.
+- liveness에 DB 체크를 넣지 않는다(재시작 루프). 스프링은 readiness에만 외부 의존성을 반영한다.
+- 헬스 그룹을 직접 구성할 수도 있다: `management.endpoint.health.group.readiness.include=db,redis`.
 
-### 21-6. 무중단 배포 (그레이스풀 셧다운)
+### 21-12. 무중단 배포
 ```
-새 Pod 뜸 → readiness 통과 → Service에 등록 → 옛 Pod에 SIGTERM
+새 Pod → readiness 통과 → EndpointSlice 등록 → 옛 Pod SIGTERM
    → preStop(sleep 5): LB에서 빠지는 시간 → 처리 중 요청 마무리 → 종료
 ```
 ```yaml
@@ -1614,59 +1696,177 @@ strategy: { rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }
 lifecycle: { preStop: { exec: { command: ["sh","-c","sleep 5"] } } }
 terminationGracePeriodSeconds: 40
 ```
-스프링 쪽: `server.shutdown: graceful`, `spring.lifecycle.timeout-per-shutdown-phase: 20s`.
-- 배포 중 간헐적 502는 대부분 **"Pod는 이미 죽었는데 LB가 아직 보내는"** 타이밍 문제다 → `preStop` 대기로 해결.
-- 롤백: `kubectl rollout undo deployment/…` (GitOps라면 Git revert).
+스프링: `server.shutdown: graceful`, `spring.lifecycle.timeout-per-shutdown-phase: 20s`.
+- 롤아웃 제어: `kubectl rollout status/pause/resume/undo`, `revisionHistoryLimit`으로 되돌릴 버전 수 관리.
 
-### 21-7. 리소스와 스케줄링
+### 21-13. 배포 전략
+
+| 전략 | 방식 | 도구 |
+|---|---|---|
+| **롤링**(기본) | 조금씩 교체 | Deployment |
+| 블루그린 | 새 버전 전체를 띄우고 트래픽을 한 번에 전환 | Service selector 교체, Argo Rollouts |
+| **카나리** | 일부 트래픽만 새 버전으로(5% → 50% → 100%) | ingress-nginx 어노테이션, Argo Rollouts, Flagger |
+| 기능 플래그 | 배포와 노출을 분리 | 앱 레벨 |
+
+카나리는 **지표 자동 판정**(에러율·지연)과 함께 쓸 때 가치가 크다.
+
+### 21-14. 리소스와 스케일링
+
 | 개념 | 내용 |
 |---|---|
-| **requests** | 스케줄러가 "이만큼 여유 있는 노드"를 고르는 기준. 실제 보장량 |
-| **limits** | 넘으면 메모리는 **OOMKilled**, CPU는 **스로틀링** |
-| QoS | requests=limits면 `Guaranteed`(우선 보호), 다르면 `Burstable` |
-| 권장(JVM) | memory requests = limits (예측 가능), **CPU limit은 두지 않기**(지연 튐 방지), CPU requests만 지정 |
-| 사이징 | 힙 + 메타스페이스 + 스레드 스택 + 네이티브 버퍼를 고려해 컨테이너 메모리는 힙의 약 1.4배 |
-| 배치 제약 | `nodeSelector`, `affinity`, `topologySpreadConstraints`(AZ 분산), `taint/toleration` |
+| requests | 스케줄러가 노드를 고르는 기준·보장량 |
+| limits | 초과 시 메모리는 **OOMKilled**, CPU는 **스로틀링** |
+| QoS | requests=limits → `Guaranteed`(가장 늦게 밀려남) |
+| **JVM 권장** | memory requests=limits, **CPU limit 미설정**, 컨테이너 메모리 ≈ 힙 × 1.4 |
+| HPA | CPU/메모리/커스텀 메트릭. `behavior`로 확장·축소 속도 조절 |
+| VPA | 적정 requests 추천·자동 조정(HPA와 같은 지표로 동시 사용 금지) |
+| KEDA | 큐 길이·**Kafka 컨슈머 랙** 기준 확장 |
+| Cluster Autoscaler / Karpenter | Pod가 `Pending`이면 노드 추가 |
+| ResourceQuota / LimitRange | 네임스페이스 총량·기본값 강제 |
 
-### 21-8. 스케일링
-- **HPA**: CPU/메모리 또는 커스텀 메트릭 기준으로 Pod 수를 조절. HPA를 쓰면 **Deployment에 `replicas`를 두지 않는다**(서로 덮어쓴다).
-- 메트릭 서버(`metrics-server`)가 있어야 CPU 기반 HPA가 동작한다.
-- **KEDA**: Kafka 컨슈머 랙, 큐 길이 같은 **이벤트 기준** 스케일링.
-- **Cluster Autoscaler**: Pod가 `Pending`이면 노드를 늘린다.
-- JVM 특성상 스케일 아웃 직후 워밍업(JIT) 구간이 있다 → HPA `stabilizationWindow`와 startupProbe를 넉넉히.
+### 21-15. 노드 교체·유지보수
+- `kubectl cordon`(새 Pod 배치 금지) → `kubectl drain`(기존 Pod 이전) → 노드 교체.
+- 이때 **PDB**가 "한 번에 몇 대까지 내릴 수 있는지"를 막아 준다. PDB가 없으면 한꺼번에 내려가 장애가 난다.
+- 스팟 인스턴스를 쓰면 종료 알림을 받고 빠지도록 `terminationGracePeriod`와 PDB를 함께 설계한다.
 
-### 21-9. 로그·디버깅 명령 모음
+### 21-16. 관측(Observability) 3종
+| 축 | 도구 | 스프링 쪽 |
+|---|---|---|
+| 메트릭 | Prometheus + Grafana(§24) | actuator + micrometer |
+| 로그 | Loki·ELK (stdout 수집) | JSON 로그, `logging.structured.format.console=ecs` |
+| 트레이스 | Tempo·Jaeger | Micrometer Tracing + OpenTelemetry, `traceId`를 로그에 포함 |
+- `kubectl get events --sort-by=.lastTimestamp`는 "왜 이 Pod가 이상한가"의 1차 단서다.
+
+### 21-17. 디버깅 명령 모음
 | 하고 싶은 것 | 명령 |
 |---|---|
-| Pod 상태 | `kubectl get pods -l app.kubernetes.io/name=library-api` |
-| 왜 안 뜨나 | `kubectl describe pod <pod>` (Events 섹션이 핵심) |
-| 로그 | `kubectl logs -f <pod>` / 이전 컨테이너 `--previous` |
-| 컨테이너 진입 | `kubectl exec -it <pod> -- sh` |
-| 로컬 포트 연결 | `kubectl port-forward svc/library-api 8080:80` |
-| 리소스 사용량 | `kubectl top pod` |
-| 배포 상태·롤백 | `kubectl rollout status/undo deployment/library-api` |
-| 임시 디버그 컨테이너 | `kubectl debug -it <pod> --image=busybox` |
+| 상태 확인 | `kubectl get pods -o wide` |
+| 원인 찾기 | `kubectl describe pod <pod>` (Events) |
+| 로그 | `kubectl logs -f <pod>` / `--previous` / `-l app=…` |
+| 진입 | `kubectl exec -it <pod> -- sh` |
+| 로컬 연결 | `kubectl port-forward svc/library-api 8080:80` |
+| 리소스 | `kubectl top pod` |
+| 롤아웃 | `kubectl rollout status/undo deployment/…` |
+| 임시 디버그 | `kubectl debug -it <pod> --image=busybox` (distroless 이미지에 유용) |
+| 이벤트 | `kubectl get events --sort-by=.lastTimestamp` |
 
-로그는 **파일이 아니라 표준출력(stdout)** 으로 내보낸다(JSON 권장) → Loki/ELK가 수집.
-
-### 21-10. 장애 증상별 원인 찾기
+### 21-18. 장애 증상별 원인
 | 증상 | 흔한 원인 | 확인 |
 |---|---|---|
-| `ImagePullBackOff` | 이미지 태그 오타, 레지스트리 인증 없음 | `describe pod` Events |
-| `CrashLoopBackOff` | 기동 중 예외, liveness 과민 설정 | `logs --previous` |
-| `OOMKilled` | 힙+네이티브가 limit 초과 | `describe pod`의 Last State, `MaxRAMPercentage` 조정 |
-| `Pending` | 노드 리소스 부족, PVC 미바인딩 | `describe pod` Events |
-| 준비 안 됨(0/1 Running) | readiness 실패(DB 연결 등) | `/actuator/health/readiness` 직접 호출 |
-| 배포 중 502 | preStop·graceful 부족 | §21-6 |
-| 간헐 504 | 앱 느림 또는 ingress 타임아웃 | p95 지표 + `proxy-read-timeout` |
+| `ImagePullBackOff` | 태그 오타·레지스트리 인증 | describe pod Events |
+| `CrashLoopBackOff` | 기동 예외, liveness 과민 | `logs --previous` |
+| `OOMKilled` | 힙+네이티브 > limit | describe pod의 Last State |
+| `Pending` | 리소스 부족·PVC 미바인딩·제약 불충족 | describe pod Events |
+| `0/1 Running` | readiness 실패 | `/actuator/health/readiness` 직접 호출 |
+| 배포 중 502 | preStop·graceful 부족 | §21-12 |
+| 간헐 504 | 앱 지연 또는 ingress 타임아웃 | p95 지표 + `proxy-read-timeout` |
+| `Evicted` | 노드 디스크·메모리 압박 | 노드 상태, requests 재조정 |
 
-### 21-11. 그 밖에 알아두면 좋은 것
-- **Job / CronJob**: 배치 작업. 스프링 배치를 CronJob으로 돌리는 경우가 많다.
-- **StatefulSet**: 순서·고정 식별자가 필요한 워크로드(Kafka, DB). **앱은 무상태로** 두는 것이 원칙.
-- **NetworkPolicy**: Pod 간 통신 제한(기본은 모두 허용).
-- **RBAC / ServiceAccount**: Pod가 쿠버네티스 API를 쓸 때만 권한이 필요하다. 보통 앱은 기본 SA로 충분.
-- **멀티 환경**: 네임스페이스 분리 + Helm values 분리 + ArgoCD ApplicationSet(§23).
-- **보안 기본**: non-root 실행, `readOnlyRootFilesystem`, 이미지 취약점 스캔(Trivy), `securityContext` 설정.
+---
+
+### 21-19. 직접 띄워서 확인한 것들 (kind 1노드 클러스터, Kubernetes v1.31)
+
+이 장의 내용을 글로만 두지 않고, **로컬에 실제 클러스터를 만들어 차트를 배포**하고 하나씩 확인했다.
+구성: kind 1노드 · 클러스터 안 MySQL 8.4 · `library-api` 이미지(앞의 Dockerfile로 빌드) · Helm 차트 그대로.
+
+**① 서비스 디스커버리와 엔드포인트**
+```
+$ kubectl get svc lib-library-api
+NAME              TYPE        CLUSTER-IP    PORT(S)
+lib-library-api   ClusterIP   10.96.60.30   80/TCP
+
+$ kubectl get endpointslice …          # 준비된 파드만 등록된다
+["10.244.0.8"]  ["10.244.0.9"]
+```
+- 앱의 DB 주소는 `jdbc:mysql://mysql:3306/library` — **서비스 이름이 그대로 호스트명**으로 동작했다(§21-6).
+- API도 정상: `POST /api/authors` → `{"id":1,...}`, `GET /api/books` → 페이지 응답, readiness·liveness 모두 `UP`.
+
+**② 파드 수 × 커넥션 풀 = DB 커넥션 (§21B-1의 실측)**
+```
+파드 2대 → MySQL Threads_connected = 21
+파드 4대 → MySQL Threads_connected = 41      (파드당 풀 10개 + 관리 연결)
+```
+파드를 2배로 늘리니 DB 커넥션도 2배가 됐다. **HPA `maxReplicas` × `maximum-pool-size` ≤ DB `max_connections`** 를 반드시 계산해야 하는 이유다.
+
+**③ 잘못된 배포는 서비스에 영향을 주지 않는다 (readiness + maxUnavailable: 0)**
+DB 주소를 없는 호스트로 바꿔 배포했더니:
+```
+lib-library-api-684cfdbc76-x9hkr   1/1  Running            ← 기존 파드, 계속 서비스
+lib-library-api-684cfdbc76-zfnkm   1/1  Running            ← 기존 파드
+lib-library-api-859987dc6-pflxj    0/1  CrashLoopBackOff   ← 새 파드, ready=false
+
+엔드포인트: 10.244.0.8 ready=true / 10.244.0.9 ready=true / 10.244.0.12 ready=false
+그 사이 API 호출: HTTP 200
+롤아웃: "1 out of 2 new replicas have been updated..." 에서 멈춤
+```
+- 준비되지 않은 파드는 **엔드포인트에서 제외**되어 트래픽을 받지 않았다.
+- `maxUnavailable: 0` 덕분에 기존 파드가 유지되어 **장애가 전파되지 않았다.**
+- `kubectl rollout undo` 한 번으로 즉시 복구됐다(API는 그동안 계속 200).
+
+**④ 메모리 limit을 넘기면 OOMKilled**
+limit을 200Mi로 줄여 배포하자:
+```
+Last State: Terminated   Reason: OOMKilled   Exit Code: 137
+```
+JVM 힙만이 아니라 **컨테이너 전체 메모리**가 기준임을 그대로 보여 준다(§21-14, §21B-2).
+
+**⑤ 그 밖에 확인한 것**
+- `PodDisruptionBudget`: `MIN AVAILABLE 1 / ALLOWED DISRUPTIONS 1` 로 등록됨(노드 드레인 시 보호).
+- `kubectl rollout history`로 리비전이 쌓이고 되돌릴 수 있음.
+- 첫 배포 시 H2를 쓰려다 실패: **H2가 `testRuntimeOnly`라 운영 jar에 없었다** → `Cannot load driver class: org.h2.Driver`로 `CrashLoopBackOff`. 로컬 테스트에서만 쓰던 의존성이 운영 이미지에 없을 수 있다는 흔한 사고를 그대로 재현한 셈이다.
+
+> 재현 방법: `kind create cluster` → 앱 jar로 이미지 빌드 → `kind load docker-image` → `helm upgrade --install`.
+> 자세한 값은 `deploy/helm/library-api/values.yaml` + 데모용 오버라이드(클러스터 내부 MySQL, ingress·HPA 끔).
+
+---
+
+## 21B. Spring Boot를 쿠버네티스에서 운영할 때 (앱 쪽 튜닝)
+
+### 21B-1. ⚠️ 커넥션 풀 × 파드 수 (가장 자주 사고 나는 지점)
+```
+HikariCP maximum-pool-size = 10,  파드 3대  →  DB 커넥션 30개
+HPA로 파드가 20대로 늘면            →  DB 커넥션 200개  → DB max_connections 초과
+```
+- **DB 최대 커넥션 = 파드 수 × 풀 크기**임을 항상 계산한다.
+- `maximum-pool-size`는 작게(보통 10 이하), HPA `maxReplicas`와 DB `max_connections`를 함께 정한다.
+- 배치·읽기 전용 워크로드는 별도 Deployment로 분리해 풀을 따로 준다.
+
+### 21B-2. JVM 메모리와 GC
+| 항목 | 권장 |
+|---|---|
+| 힙 | `-XX:MaxRAMPercentage=70` (컨테이너 limit 기준) |
+| 컨테이너 메모리 | 힙 + 메타스페이스 + 스레드 스택 + 네이티브 ≈ 힙 × 1.4 |
+| GC | 소형 컨테이너(≤2GB·1~2 CPU)는 SerialGC/G1, 대형·지연 민감은 G1/ZGC |
+| CPU | CPU limit이 있으면 JVM이 인식하는 프로세서 수가 줄어 스레드 풀·GC 스레드가 작아진다 |
+| 기동 속도 | CDS, AppCDS, Spring AOT/Native 이미지 고려 |
+
+### 21B-3. 스레드 풀과 동시성
+- 톰캣 `server.tomcat.threads.max`(기본 200)는 **파드 하나가 동시에 처리할 요청 수**다. DB 풀이 10이면 나머지는 대기만 하므로 균형을 맞춘다.
+- JDK 21+ **가상 스레드**(`spring.threads.virtual.enabled=true`)를 쓰면 스레드 병목은 줄지만 **DB 커넥션 풀은 그대로 병목**이다.
+- 스케일 아웃은 CPU뿐 아니라 **DB·외부 API의 처리량**까지 함께 늘어나는지 확인하고 결정한다.
+
+### 21B-4. 설정·프로파일
+- 환경변수 주입이 기본. `SPRING_PROFILES_ACTIVE=prod`.
+- Kubernetes ConfigMap을 직접 읽는 `spring-cloud-kubernetes`도 있지만, 대부분은 환경변수로 충분하다.
+- 시간대는 컨테이너·DB·JVM 모두 UTC로 통일(`-Duser.timezone=UTC`).
+
+### 21B-5. Actuator 노출 범위
+- `/actuator/health`, `/actuator/prometheus`만 열고 나머지는 닫는다(`management.endpoints.web.exposure.include`).
+- 관리 포트를 분리해 Ingress로 노출되지 않게 할 수 있다: `management.server.port: 8081`.
+- `health.show-details: when-authorized` — 외부에 DB 접속 실패 원인이 그대로 노출되지 않게 한다.
+
+### 21B-6. 로그·트레이스
+- **stdout에 JSON 한 줄**로 남긴다(`logging.structured.format.console=ecs` 또는 logback JSON 인코더).
+- `traceId`·`spanId`를 패턴에 포함하면 로그와 트레이스가 연결된다.
+- 파드 이름·버전을 로그에 넣으면(`env`로 주입) 어느 인스턴스에서 난 문제인지 바로 보인다.
+
+### 21B-7. 배포 전 체크리스트
+- [ ] 프로브 3종(startup 포함), graceful shutdown, preStop
+- [ ] requests/limits, podAntiAffinity, PDB
+- [ ] DB 커넥션 풀 × maxReplicas ≤ DB 허용치
+- [ ] ConfigMap/Secret 분리, 이미지 태그 고정
+- [ ] 메트릭·경보·대시보드, 로그 JSON, traceId
+- [ ] 롤백 절차(`rollout undo` 또는 Git revert) 확인
 
 ## 22. Helm 차트
 
