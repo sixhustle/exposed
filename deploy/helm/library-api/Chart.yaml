@@ -1,0 +1,6 @@
+apiVersion: v2
+name: library-api
+description: Kotlin + Spring Boot 도서 API (Helm 차트 학습 예제)
+type: application
+version: 0.1.0        # 차트 자체의 버전 (템플릿이 바뀌면 올린다)
+appVersion: "0.0.1"   # 애플리케이션 버전 (이미지 태그 기본값으로 쓴다)

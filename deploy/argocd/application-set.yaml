@@ -1,0 +1,33 @@
+# 환경이 여러 개일 때: dev/stg/prod를 한 정의로 만든다
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: library-api-envs
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - env: dev
+            namespace: library-dev
+            values: values-dev.yaml
+          - env: prod
+            namespace: library
+            values: values-prod.yaml
+  template:
+    metadata:
+      name: 'library-api-{{env}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/example/library-api.git
+        targetRevision: main
+        path: deploy/helm/library-api
+        helm:
+          valueFiles: ['values.yaml', '{{values}}']
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{namespace}}'
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+        syncOptions: ['CreateNamespace=true']

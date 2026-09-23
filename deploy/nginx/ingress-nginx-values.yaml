@@ -1,0 +1,20 @@
+# ingress-nginx 컨트롤러 설치용 values (helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -f 이 파일)
+controller:
+  replicaCount: 2
+  config:
+    # 프록시가 넘기는 실제 클라이언트 IP를 X-Forwarded-For로 전달
+    use-forwarded-headers: "true"
+    # 업스트림(우리 앱)과의 keepalive: 커넥션 재사용으로 지연 감소
+    upstream-keepalive-connections: "320"
+    proxy-body-size: "8m"
+    # 로그를 JSON으로 → Loki/ELK에서 파싱하기 쉽다
+    log-format-escape-json: "true"
+    log-format-upstream: '{"time":"$time_iso8601","remote_addr":"$remote_addr","request":"$request","status":$status,"upstream_status":"$upstream_status","request_time":$request_time,"upstream_time":"$upstream_response_time","user_agent":"$http_user_agent"}'
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true      # Prometheus가 컨트롤러 메트릭도 수집
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+  service:
+    externalTrafficPolicy: Local   # 클라이언트 IP 보존

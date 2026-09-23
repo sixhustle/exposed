@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "library-api.fullname" . }}
+  labels: {{- include "library-api.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}   {{/* HPA를 쓰면 replicas를 적지 않는다 (서로 덮어써서 충돌) */}}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "library-api.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # 무중단 배포: 새 파드가 준비된 뒤에 옛 파드를 내린다
+  template:
+    metadata:
+      labels: {{- include "library-api.selectorLabels" . | nindent 8 }}
+      annotations:
+        # ConfigMap이 바뀌면 체크섬이 바뀌어 파드가 새로 뜬다 (설정 변경 반영)
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "library-api.fullname" . }}-config
+            {{- if .Values.existingSecret }}
+            - secretRef:
+                name: {{ .Values.existingSecret }}   {{/* 비밀값은 차트 밖에서 관리 */}}
+            {{- end }}
+          # 스프링 부트 액추에이터 프로브
+          startupProbe:            # 기동이 느린 JVM을 위해: 이게 성공해야 아래 두 프로브가 시작된다
+            httpGet: { path: /actuator/health/readiness, port: http }
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:          # 트래픽을 받을 준비가 됐는가 (DB 연결 등)
+            httpGet: { path: /actuator/health/readiness, port: http }
+            periodSeconds: 10
+          livenessProbe:           # 살아 있는가 (실패하면 재시작)
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]   # 그레이스풀 종료: LB에서 빠질 시간을 준다
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      terminationGracePeriodSeconds: 40

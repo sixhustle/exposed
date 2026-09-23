@@ -1,0 +1,59 @@
+# 기본값. 환경별로 values-prod.yaml 등으로 덮어쓴다.
+replicaCount: 2
+
+image:
+  repository: ghcr.io/example/library-api
+  tag: ""            # 비워 두면 Chart.appVersion 사용. CI가 커밋 SHA로 채우는 것을 권장
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  host: library-api.example.com
+  tls:
+    enabled: true
+    secretName: library-api-tls
+  annotations:
+    # nginx ingress 설정은 어노테이션으로 준다
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 768Mi    # JVM: limit과 request 메모리를 같게 두는 편이 예측 가능하다
+  limits:
+    memory: 768Mi    # CPU limit은 두지 않는 것을 권장 (스로틀링으로 지연 발생)
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# 애플리케이션 설정 (ConfigMap으로 들어간다)
+config:
+  SPRING_PROFILES_ACTIVE: prod
+  SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/library?serverTimezone=UTC&characterEncoding=UTF-8
+  SPRING_DATA_REDIS_HOST: redis-master
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=70 -Duser.timezone=UTC"
+
+# 비밀값은 차트에 넣지 않는다. 외부에서 만든 Secret 이름만 참조한다
+existingSecret: library-api-secrets   # SPRING_DATASOURCE_USERNAME / PASSWORD 등
+
+serviceMonitor:
+  enabled: true      # Prometheus Operator가 이 리소스를 보고 스크랩한다
+  interval: 15s
+  path: /actuator/prometheus

@@ -1,0 +1,14 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor        # Prometheus Operator가 읽어서 스크랩 대상을 자동 등록한다
+metadata:
+  name: {{ include "library-api.fullname" . }}
+  labels: {{- include "library-api.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "library-api.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: {{ .Values.serviceMonitor.path }}
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

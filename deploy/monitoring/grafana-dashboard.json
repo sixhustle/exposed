@@ -1,0 +1,61 @@
+{
+  "title": "library-api",
+  "uid": "library-api",
+  "tags": ["spring-boot", "kotlin"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "namespace", "type": "query", "datasource": "Prometheus", "query": "label_values(http_server_requests_seconds_count, namespace)" }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries", "title": "처리량 (RPS)", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(http_server_requests_seconds_count{application=\"library-api\"}[5m])) by (uri)", "legendFormat": "{{uri}}" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "응답시간 p95 / p99", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket{application=\"library-api\"}[5m])) by (le))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(http_server_requests_seconds_bucket{application=\"library-api\"}[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "에러율 (5xx)", "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(http_server_requests_seconds_count{application=\"library-api\",status=~\"5..\"}[5m])) / sum(rate(http_server_requests_seconds_count{application=\"library-api\"}[5m]))", "legendFormat": "error rate" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "JVM 힙 사용량", "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "targets": [
+        { "expr": "sum(jvm_memory_used_bytes{application=\"library-api\",area=\"heap\"}) by (pod)", "legendFormat": "{{pod}} used" },
+        { "expr": "sum(jvm_memory_max_bytes{application=\"library-api\",area=\"heap\"}) by (pod)", "legendFormat": "{{pod}} max" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "DB 커넥션 풀 (HikariCP)", "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "targets": [
+        { "expr": "hikaricp_connections_active{application=\"library-api\"}", "legendFormat": "active" },
+        { "expr": "hikaricp_connections_idle{application=\"library-api\"}", "legendFormat": "idle" },
+        { "expr": "hikaricp_connections_pending{application=\"library-api\"}", "legendFormat": "pending" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "GC 일시정지", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "rate(jvm_gc_pause_seconds_sum{application=\"library-api\"}[5m])", "legendFormat": "{{action}} {{cause}}" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Kafka 컨슈머 랙", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "sum(kafka_consumergroup_lag{consumergroup=\"library-book-events\"}) by (topic)", "legendFormat": "{{topic}}" }
+      ]
+    }
+  ]
+}

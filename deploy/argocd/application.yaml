@@ -1,0 +1,40 @@
+# ArgoCD: "Git에 있는 것이 곧 클러스터 상태"(GitOps).
+# kubectl apply -f 로 이 리소스만 등록해 두면, 이후 배포는 Git 커밋으로 이루어진다.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: library-api
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io   # Application을 지우면 배포된 리소스도 함께 정리
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/library-api.git
+    targetRevision: main          # 이 브랜치를 바라본다
+    path: deploy/helm/library-api # 차트 위치
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-prod.yaml
+      # 이미지 태그만 CI가 바꾸고 싶다면 parameters를 쓰거나, values-prod.yaml을 커밋한다
+      # parameters:
+      #   - name: image.tag
+      #     value: 2026.09.23-a1b2c3d
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: library
+  syncPolicy:
+    automated:
+      prune: true      # Git에서 지운 리소스는 클러스터에서도 지운다
+      selfHeal: true   # 누가 kubectl로 손대면 Git 상태로 되돌린다
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 2m
+  revisionHistoryLimit: 10

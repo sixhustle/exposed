@@ -1,0 +1,65 @@
+# Prometheus 경보 규칙. Prometheus Operator를 쓰면 PrometheusRule 리소스로 등록한다.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: library-api-rules
+  labels:
+    release: kube-prometheus-stack   # Operator가 이 라벨로 규칙을 찾는다
+spec:
+  groups:
+    - name: library-api
+      rules:
+        # 에러율: 5xx 응답 비율이 5분간 5%를 넘으면
+        - alert: LibraryApiHighErrorRate
+          expr: |
+            sum(rate(http_server_requests_seconds_count{application="library-api",status=~"5.."}[5m]))
+            / sum(rate(http_server_requests_seconds_count{application="library-api"}[5m])) > 0.05
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "library-api 5xx 비율이 5%를 넘었습니다"
+            description: "최근 5분 에러율 {{ $value | humanizePercentage }}"
+
+        # 지연: 95퍼센타일 응답이 1초를 넘으면
+        - alert: LibraryApiSlowResponse
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(http_server_requests_seconds_bucket{application="library-api"}[5m])) by (le)) > 1
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "library-api p95 응답이 1초를 넘었습니다"
+
+        # JVM 힙 사용률
+        - alert: LibraryApiHighHeap
+          expr: |
+            sum(jvm_memory_used_bytes{application="library-api",area="heap"}) by (pod)
+            / sum(jvm_memory_max_bytes{application="library-api",area="heap"}) by (pod) > 0.9
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $labels.pod }} 힙 사용률 90% 초과"
+
+        # DB 커넥션 풀 고갈
+        - alert: LibraryApiDbPoolExhausted
+          expr: hikaricp_connections_pending{application="library-api"} > 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "DB 커넥션을 기다리는 스레드가 있습니다"
+
+        # 파드 재시작 (프로브 실패 등)
+        - alert: LibraryApiPodRestarting
+          expr: increase(kube_pod_container_status_restarts_total{container="app",namespace="library"}[15m]) > 2
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "{{ $labels.pod }} 이 15분 내 2회 이상 재시작했습니다"
+
+        # Kafka 컨슈머 랙 (kafka-exporter 기준)
+        - alert: LibraryApiConsumerLag
+          expr: sum(kafka_consumergroup_lag{consumergroup="library-book-events"}) > 1000
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "book-events 컨슈머 랙이 1000을 넘었습니다"

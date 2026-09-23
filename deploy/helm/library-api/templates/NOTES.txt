@@ -1,0 +1,8 @@
+{{ include "library-api.fullname" . }} 배포 완료.
+
+  상태 확인:  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  로그:      kubectl logs -l app.kubernetes.io/instance={{ .Release.Name }} -f
+{{- if .Values.ingress.enabled }}
+  주소:      https://{{ .Values.ingress.host }}
+{{- end }}
+  메트릭:    /actuator/prometheus  (ServiceMonitor: {{ .Values.serviceMonitor.enabled }})

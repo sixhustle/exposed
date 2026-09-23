@@ -1,0 +1,11 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "library-api.fullname" . }}
+  labels: {{- include "library-api.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}   # 노드 교체 시에도 최소 1대는 남긴다
+  selector:
+    matchLabels: {{- include "library-api.selectorLabels" . | nindent 6 }}
+{{- end }}
