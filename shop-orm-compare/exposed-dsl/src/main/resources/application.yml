@@ -1,0 +1,45 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: exposed-dsl
+  flyway:
+    locations: classpath:db/migration # 스키마는 Flyway. Exposed는 DDL을 만들지 않는다
+  exposed:
+    generate-ddl: false
+  data:
+    web:
+      pageable:
+        max-page-size: 100
+  mvc:
+    problemdetails:
+      enabled: true
+
+# ../docker/compose.yaml 의 소스(3307) / 레플리카(3308)
+# 타임존 옵션(connectionTimeZone 등)은 넣지 않는다. JVM 타임존을 UTC로 고정하고(ShopClock), 드라이버는 그 값을 그대로 쓴다 (보고서 06-4)
+app:
+  datasource:
+    writer:
+      jdbc-url: jdbc:mysql://${SOURCE_HOST:localhost}:${SOURCE_PORT:3307}/shop?rewriteBatchedStatements=true
+      username: shop
+      password: shop
+      pool-name: writer-pool
+      maximum-pool-size: 10
+    reader:
+      jdbc-url: jdbc:mysql://${REPLICA_HOST:localhost}:${REPLICA_PORT:3308}/shop
+      username: shop_reader
+      password: shop_reader
+      pool-name: reader-pool
+      maximum-pool-size: 10
+      read-only: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+logging:
+  level:
+    Exposed: debug # 실행 SQL (바인딩 값이 인라인되므로 운영에서는 info, 보고서 06)

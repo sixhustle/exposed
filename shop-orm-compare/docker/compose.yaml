@@ -1,0 +1,58 @@
+# MySQL 8.4 소스(writer) + 레플리카(reader), GTID 기반 비동기 복제.
+#   docker compose -f docker/compose.yaml up -d
+#   소스: localhost:3307 (shop / shop)      → 쓰기 트랜잭션
+#   레플리카: localhost:3308 (shop_reader)  → @Transactional(readOnly = true)
+# 초기화 스크립트는 볼륨이 비어 있을 때 한 번만 실행된다. 설정을 바꿨으면 down -v 후 다시 up.
+name: shop-orm-compare
+
+services:
+  mysql-source:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: shop
+      MYSQL_USER: shop
+      MYSQL_PASSWORD: shop
+      TZ: UTC
+    ports:
+      - "${SOURCE_PORT:-3307}:3306"
+    volumes:
+      - ./mysql/source/my.cnf:/etc/mysql/conf.d/replication.cnf:ro
+      - ./mysql/common/01-reader-user.sql:/docker-entrypoint-initdb.d/01-reader-user.sql:ro
+      - ./mysql/source/02-replication-user.sql:/docker-entrypoint-initdb.d/02-replication-user.sql:ro
+      - ./mysql/source/99-reset-binlog.sql:/docker-entrypoint-initdb.d/99-reset-binlog.sql:ro
+      - source-data:/var/lib/mysql
+    healthcheck:
+      # TCP(127.0.0.1)로 확인: 초기화 중 임시 서버는 --skip-networking 이라 소켓 ping만으로는 "준비됨"으로 오판한다
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -uroot -proot -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  mysql-replica:
+    image: mysql:8.4
+    depends_on:
+      mysql-source:
+        condition: service_healthy
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: shop
+      MYSQL_USER: shop
+      MYSQL_PASSWORD: shop
+      TZ: UTC
+    ports:
+      - "${REPLICA_PORT:-3308}:3306"
+    volumes:
+      - ./mysql/replica/my.cnf:/etc/mysql/conf.d/replication.cnf:ro
+      - ./mysql/common/01-reader-user.sql:/docker-entrypoint-initdb.d/01-reader-user.sql:ro
+      - ./mysql/replica/02-start-replica.sql:/docker-entrypoint-initdb.d/02-start-replica.sql:ro
+      - replica-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -uroot -proot -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  source-data:
+  replica-data:

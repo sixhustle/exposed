@@ -1,0 +1,60 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '4.1.1'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.example'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-webmvc'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-flyway'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.flywaydb:flyway-mysql'
+
+    // QueryDSL: Hibernate 7에서는 OpenFeign 포크 (com.querydsl 5.x는 유지보수 중단)
+    implementation 'io.github.openfeign.querydsl:querydsl-jpa:7.6'
+    annotationProcessor 'io.github.openfeign.querydsl:querydsl-apt:7.6:jpa'
+    annotationProcessor 'jakarta.persistence:jakarta.persistence-api'
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    runtimeOnly 'com.mysql:mysql-connector-j'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
+    testImplementation 'org.springframework.boot:spring-boot-testcontainers'
+    testImplementation 'org.testcontainers:testcontainers-junit-jupiter'
+    testImplementation 'org.testcontainers:testcontainers-mysql'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    jvmArgs '-Duser.timezone=UTC' // 세 프로젝트가 같은 DB에 같은 시각을 쓰도록 JVM 타임존 고정
+    // 테스트용 MySQL 소스·레플리카가 ../docker 의 설정·초기화 스크립트를 그대로 쓴다
+    systemProperty 'compare.docker-dir', file('../docker').absolutePath
+}
+
+tasks.named('bootRun') {
+    jvmArgs '-Duser.timezone=UTC'
+}
